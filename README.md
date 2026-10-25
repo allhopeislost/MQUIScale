@@ -24,8 +24,8 @@ A [MacroQuest](https://github.com/macroquest/macroquest) plugin that draws the E
 ## Install
 
 1. Download `MQUIScale.dll` from the [Releases](../../releases) page or from the [`dll`](dll) folder (or build it, see below).
-2. Close EverQuest and MacroQuest, copy the DLL into your MacroQuest `plugins` folder.
-3. Start MacroQuest and EverQuest, then in game: `/plugin mquiscale`
+2. Copy the DLL into your MacroQuest `plugins` folder.
+3. In game: `/plugin mquiscale`
 4. `/uiscale 1.5` (or use the slider in the window that `/uiscale ui` shows).
 
 The plugin does nothing until you choose a factor above 1.0. `/plugin mquiscale unload` removes all hooks and restores the screen size and window positions.

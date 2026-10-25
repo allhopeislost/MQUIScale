@@ -2,7 +2,7 @@
 
 A [MacroQuest](https://github.com/macroquest/macroquest) plugin that draws the EverQuest **Rain of Fear 2 (RoF2)** interface larger while the 3D world stays at native resolution. Useful on high-resolution monitors where the classic UI becomes tiny.
 
-> **Made with AI.** The code in this repository was written by an AI (Claude, by Anthropic) in conversation with the repository owner, who tested every version in game. It works on the owner's setup, but it has not been reviewed by MacroQuest developers. Use at your own risk.
+> **Made with AI.** The code in this repository was written by an AI (Claude, by Anthropic) in conversation with the repository owner, who tested every version in game. It works on the owner's setup; use at your own risk.
 
 ## Requirements
 

@@ -51,8 +51,8 @@ END
 //
 
 VS_VERSION_INFO VERSIONINFO
- FILEVERSION 2,6
- PRODUCTVERSION 2,6
+ FILEVERSION 2,7
+ PRODUCTVERSION 2,7
  FILEFLAGSMASK 0x3fL
 #ifdef _DEBUG
  FILEFLAGS 0x1L
@@ -73,11 +73,11 @@ BEGIN
 #else
             VALUE "FileDescription", "MQUIScale Release Version"
 #endif
-            VALUE "FileVersion", "2.6"
+            VALUE "FileVersion", "2.7"
             VALUE "InternalName", "MQUIScale.dll"
             VALUE "OriginalFilename", "MQUIScale.dll"
             VALUE "ProductName", "MQUIScale"
-            VALUE "ProductVersion", "2.6"
+            VALUE "ProductVersion", "2.7"
         END
     END
     BLOCK "VarFileInfo"

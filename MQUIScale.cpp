@@ -43,7 +43,7 @@
 #include <map>
 
 PreSetup("MQUIScale");
-PLUGIN_VERSION(2.6);
+PLUGIN_VERSION(2.7);
 
 // mq::AddRenderCallbacks (MacroQuest's render callback API, available through
 // mq/Plugin.h) is used to release our D3DPOOL_DEFAULT buffer when the device
@@ -141,7 +141,7 @@ static constexpr uint32_t NameTagSpecularMarker = 0xFF010203;
 // puts GlyphSpecular back before drawing.
 static constexpr uint32_t GlyphSpecular = 0xFF000000;
 static constexpr uint32_t ClipMarkerTag = 0xFE000000;
-static bool s_useLabelRoom = true;
+static bool s_useLabelRoom = false;
 static bool s_clipMarksWanted = false;   // marks are written (C on, Even, scaled)
 static std::vector<RECT> s_clipRects = { RECT{} };   // index 0 = none
 static std::map<std::tuple<LONG, LONG, LONG, LONG>, uint32_t> s_clipRectIds;
@@ -176,7 +176,7 @@ static bool s_nameTagMarkerInstalled = false;
 // Only applied around our scaled draws and restored right after, so the
 // world and the game's own state cache are unaffected.
 enum class TextureFilter { Game = 0, Sharp = 1, Smooth = 2 };
-static TextureFilter s_textureFilter = TextureFilter::Game;
+static TextureFilter s_textureFilter = TextureFilter::Sharp;
 
 struct SamplerOverride
 {
@@ -322,24 +322,7 @@ static UINT VertexCountForPrimitives(D3DPRIMITIVETYPE type, UINT primitiveCount)
 // and gbInZone/gGameState are only refreshed by MacroQuest's pulse, which does
 // not run while the world loads (gbInZone stays true from character select).
 // So the live game state is checked too: the load runs outside
-// CHARSELECT/CHARCREATE/INGAME (assumed POSTCHARSELECT; changes are logged).
-static void LogLiveGameState(int state)
-{
-	static int lastState = INT_MIN;
-	if (state == lastState)
-		return;
-	lastState = state;
-	char path[MAX_PATH];
-	sprintf_s(path, "%s\\MQUIScale.log", gPathLogs);
-	FILE* file = nullptr;
-	if (fopen_s(&file, path, "a") == 0 && file)
-	{
-		fprintf(file, "live game state %d (gGameState %d, gbInZone %d, tick %llu)\n",
-			state, gGameState, gbInZone ? 1 : 0, MQGetTickCount64());
-		fclose(file);
-	}
-}
-
+// CHARSELECT/CHARCREATE/INGAME (LOGGINGIN while the world loads).
 static bool IsScalingActive()
 {
 	if (!s_inUIPass || s_scale == 1.0f)
@@ -347,7 +330,6 @@ static bool IsScalingActive()
 	if (s_inLoginFrontend)
 		return true;
 	const int state = GetGameState();
-	LogLiveGameState(state);
 	return gbInZone && (state == GAMESTATE_INGAME || state == GAMESTATE_CHARSELECT || state == GAMESTATE_CHARCREATE);
 }
 
@@ -434,7 +416,7 @@ enum class WideGlyphs
 	Spacing,    // like Overhang to the right, and the game's advance grows to make room
 	Even,       // every glyph at full width, spread evenly over its word (words stay put)
 };
-static WideGlyphs s_wideGlyphs = WideGlyphs::Overhang;
+static WideGlyphs s_wideGlyphs = WideGlyphs::Even;
 // Overhang mode: share of the overhang moved to the left of the glyph (into
 // the space before it, so it runs less into the next letter), and how much a
 // wide glyph is condensed first (0.1 = at most 10 %) before it overhangs.
@@ -2710,7 +2692,7 @@ static void UIScaleCommand(PlayerClient*, const char* line)
 
 	if (arg[0] == 0)
 	{
-		WriteChatf("\ag[MQUIScale]\ax scale %.2f, hooks %s. Usage: /uiscale <1.0-3.0> | off | ui | filter game|sharp|smooth | sharptext on|off | dump",
+		WriteChatf("\ag[MQUIScale]\ax scale %.2f, hooks %s. Usage: /uiscale <1.0-3.0> | off | ui | filter game|sharp|smooth | sharptext on|off | wide squeeze|overhang|smaller|spacing|even | condense on|off | dump",
 			s_scale, s_hooksInstalled ? "on" : "not installed");
 		return;
 	}
@@ -2802,7 +2784,7 @@ static void UIScaleCommand(PlayerClient*, const char* line)
 	float factor = GetFloatFromString(arg, -1.0f);
 	if (factor <= 0.0f)
 	{
-		WriteChatf("\ar[MQUIScale]\ax '%s' is not a number. Usage: /uiscale <1.0-3.0> | off | ui | filter game|sharp|smooth | sharptext on|off | wide squeeze|overhang|smaller|spacing|even | dump", arg);
+		WriteChatf("\ar[MQUIScale]\ax '%s' is not a number. Usage: /uiscale <1.0-3.0> | off | ui | filter game|sharp|smooth | sharptext on|off | wide squeeze|overhang|smaller|spacing|even | condense on|off | dump", arg);
 		return;
 	}
 
@@ -2821,16 +2803,16 @@ static void UIScaleCommand(PlayerClient*, const char* line)
 struct Settings
 {
 	float scale = 1.0f;
-	TextureFilter filter = TextureFilter::Game;
+	TextureFilter filter = TextureFilter::Sharp;
 	bool sharpText = true;
 	bool nameTagFilter = true;
 	bool showWindow = true;
-	WideGlyphs wideGlyphs = WideGlyphs::Overhang;
+	WideGlyphs wideGlyphs = WideGlyphs::Even;
 	float overhangLeft = 0.5f;
 	float overhangSqueeze = 0.0f;
 	float spacingMinOverhang = 1.5f;
 	float evenSpaceShrink = 0.3f;
-	bool useLabelRoom = true;
+	bool useLabelRoom = false;
 	bool evenCondense = true;
 
 	bool operator==(const Settings& other) const
@@ -2879,7 +2861,7 @@ static void LoadSettings()
 	s_pendingScale = std::clamp(GetFloatFromString(value, 1.0f), MinScale, MaxScale);
 	s_scalePending = s_pendingScale != 1.0f;
 
-	GetPrivateProfileStringA("Settings", "TextureFilter", "game", value, sizeof(value), s_iniPath);
+	GetPrivateProfileStringA("Settings", "TextureFilter", "sharp", value, sizeof(value), s_iniPath);
 	s_textureFilter = ci_equals(value, "sharp") ? TextureFilter::Sharp
 		: ci_equals(value, "smooth") ? TextureFilter::Smooth : TextureFilter::Game;
 
@@ -2887,7 +2869,7 @@ static void LoadSettings()
 	s_nameTagFilter = GetPrivateProfileIntA("Settings", "NameTagFilter", 1, s_iniPath) != 0;
 	s_showWindow = GetPrivateProfileIntA("Settings", "ShowWindow", 1, s_iniPath) != 0;
 
-	GetPrivateProfileStringA("Settings", "WideLetters", "overhang", value, sizeof(value), s_iniPath);
+	GetPrivateProfileStringA("Settings", "WideLetters", "even", value, sizeof(value), s_iniPath);
 	s_wideGlyphs = ci_equals(value, "squeeze") ? WideGlyphs::Squeeze
 		: ci_equals(value, "smaller") ? WideGlyphs::Smaller
 		: ci_equals(value, "spacing") ? WideGlyphs::Spacing
@@ -2900,7 +2882,7 @@ static void LoadSettings()
 	s_spacingMinOverhang = std::clamp(GetFloatFromString(value, 1.5f), 0.5f, 4.0f);
 	GetPrivateProfileStringA("Settings", "EvenSpaceShrink", "0.3", value, sizeof(value), s_iniPath);
 	s_evenSpaceShrink = std::clamp(GetFloatFromString(value, 0.3f), 0.0f, 0.6f);
-	s_useLabelRoom = GetPrivateProfileIntA("Settings", "UseLabelRoom", 1, s_iniPath) != 0;
+	s_useLabelRoom = GetPrivateProfileIntA("Settings", "UseLabelRoom", 0, s_iniPath) != 0;
 	s_evenCondense = GetPrivateProfileIntA("Settings", "CondenseLetters", 1, s_iniPath) != 0;
 
 	s_savedSettings = CurrentSettings();
@@ -2940,9 +2922,7 @@ static void ApplyPendingScale()
 		return;
 
 	s_scalePending = false;
-	DumpState("before applying saved scale");
 	SetScale(s_pendingScale);
-	DumpState("after applying saved scale");
 	WriteChatf("\ag[MQUIScale]\ax scale %.2f loaded from MQUIScale.ini", s_scale);
 }
 
@@ -3071,8 +3051,6 @@ PLUGIN_API void OnReloadUI()
 	// New windows (after /loadskin or entering the world): fit them again.
 	ApplyScreenExtent();
 	FitWindowsToScreen();
-	if (s_scale != 1.0f)
-		DumpState("ReloadUI, after fitting windows");
 }
 
 PLUGIN_API void OnUpdateImGui()
@@ -3113,9 +3091,6 @@ PLUGIN_API void OnUpdateImGui()
 		s_textureFilter = static_cast<TextureFilter>(filter);
 
 		ImGui::Checkbox("Sharp text", &s_sharpText);
-		ImGui::SameLine();
-		ImGui::Text("(hook %s, %dx, %d textures, %d draws/frame)", s_uploadHookInstalled ? "ok" : "missing",
-			s_twinFactor, static_cast<int>(s_twins.size()), s_lastStats.sharpText);
 
 		// Live comparison of the ways to fit W, M and other wide letters.
 		int wide = static_cast<int>(s_wideGlyphs);
@@ -3132,16 +3107,7 @@ PLUGIN_API void OnUpdateImGui()
 		ImGui::RadioButton("Even", &wide, static_cast<int>(WideGlyphs::Even));
 		if (s_wideGlyphs == WideGlyphs::Even)
 		{
-			ImGui::Text("(%d glyphs placed/frame)", s_lastStats.widenedGlyphs);
-			ImGui::Text("(%d lines used label room, %d still condensed, narrowest %.0f %%, %d with shrunk spaces)",
-				s_lastStats.grownLines, s_lastStats.condensedLines, s_lastStats.minDrawScale * 100.0f,
-				s_lastStats.shrunkSpaceLines);
 			ImGui::Checkbox("Use label room (C)", &s_useLabelRoom);
-			if (!s_clipHookInstalled)
-			{
-				ImGui::SameLine();
-				ImGui::TextDisabled("(hook not installed)");
-			}
 			ImGui::SameLine();
 			ImGui::Checkbox("Condense letters (A)", &s_evenCondense);
 			float shrinkPct = s_evenSpaceShrink * 100.0f;
@@ -3149,9 +3115,6 @@ PLUGIN_API void OnUpdateImGui()
 				s_evenSpaceShrink = std::clamp(shrinkPct / 100.0f, 0.0f, 0.6f);
 		}
 		SetWideGlyphs(static_cast<WideGlyphs>(wide));
-		if (s_wideGlyphs == WideGlyphs::Spacing)
-			ImGui::Text("(%d glyphs widened/frame, %d letters given more room, %d texts relaid out)",
-				s_lastStats.widenedGlyphs, static_cast<int>(s_widenedChars.size()), s_lastRelayoutCount);
 		if (s_wideGlyphs == WideGlyphs::Spacing)
 		{
 			// Applied when the slider is let go: the widths and twins are redone.
@@ -3167,7 +3130,6 @@ PLUGIN_API void OnUpdateImGui()
 		}
 		if (s_wideGlyphs == WideGlyphs::Overhang)
 		{
-			ImGui::Text("(%d glyphs widened/frame)", s_lastStats.widenedGlyphs);
 			float leftPct = s_overhangLeft * 100.0f;
 			if (ImGui::SliderFloat("Overhang to the left", &leftPct, 0.0f, 100.0f, "%.0f %%"))
 				s_overhangLeft = std::clamp(leftPct / 100.0f, 0.0f, 1.0f);
@@ -3184,30 +3146,7 @@ PLUGIN_API void OnUpdateImGui()
 		}
 
 		ImGui::Separator();
-		ImGui::Text("Hooks: %s, UI pass hook: %s, mouse hooks: %d, menu size hook: %s, window ini hooks: %s", s_hooksInstalled ? "on" : "off",
-			s_uiHookInstalled ? "ok" : "missing", s_mouseHooksInstalled, s_screenSizeHookInstalled ? "ok" : "missing",
-			s_storeIniHookInstalled && s_loadIniHookInstalled ? "ok" : "missing");
-		if (pWndMgr)
-		{
-			int realX = 0, realY = 0;
-			GetRealUISize(realX, realY);
-			ImGui::Text("UI screen: %u x %u, windows moved: %d", pWndMgr->ScreenExtentX, pWndMgr->ScreenExtentY,
-				static_cast<int>(s_movedWindows.size()));
-			ImGui::Text("Real UI size: %d x %d (client extent %u x %u, ScreenRes %d x %d)", realX, realY,
-				s_origExtentX, s_origExtentY,
-				pEverQuestInfo ? pEverQuestInfo->ScreenXRes : 0, pEverQuestInfo ? pEverQuestInfo->ScreenYRes : 0);
-		}
-		ImGui::Text("UI passes/frame: %d", s_lastStats.uiPasses);
-		ImGui::Text("Scaled draws/frame: %d", s_lastStats.scaled);
-		ImGui::Text("Skipped (not RHW): %d", s_lastStats.notRHW);
-		ImGui::Text("Failed (drawn unscaled): %d", s_lastStats.failed);
-
-		ImGui::Separator();
 		ImGui::Checkbox("Name tag filter", &s_nameTagFilter);
-		ImGui::SameLine();
-		ImGui::Text(s_nameTagMarkerInstalled ? "(marker)" : "(window rects)");
-		ImGui::Text("Text outside windows (unscaled): %d vertices/frame", s_lastStats.keptVertices);
-		ImGui::Text("Visible windows: %d", static_cast<int>(s_windowRects.size()));
 	}
 	ImGui::End();
 }

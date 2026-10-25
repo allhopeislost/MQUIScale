@@ -18,7 +18,7 @@ A [MacroQuest](https://github.com/macroquest/macroquest) plugin that draws the E
 - Window positions saved by EverQuest (UI ini) stay correct, so playing at 1.0 later does not move your windows.
 - Name tags above heads are left at their normal size.
 - Optional "sharp text": glyphs are rendered again at 2x or 3x resolution so scaled text stays crisp instead of blurry.
-- Settings are saved in `config\MQUIScale.ini` and applied again next time.
+- Settings are saved in `config\MQUIScale.ini` and applied again next time. Defaults for a new install: texture filter Sharp, sharp text on, wide letters Even, condense letters on, label room off, spaces may shrink 30 %, name tag filter on.
 
 ## Install
 
@@ -36,7 +36,7 @@ The plugin does nothing until you choose a factor above 1.0. `/plugin mquiscale 
 | `/uiscale` | Show the current state and usage. |
 | `/uiscale <1.0-3.0>` | Set the scale factor. |
 | `/uiscale off` | Back to 1.0 immediately. |
-| `/uiscale ui` | Show/hide the settings window (slider, options, counters). |
+| `/uiscale ui` | Show/hide the settings window (slider and options). |
 | `/uiscale filter game\|sharp\|smooth` | Texture filtering for scaled UI: as the game does, point (sharp) or linear (smooth). |
 | `/uiscale sharptext on\|off` | Render text at higher resolution for crisp scaled text. |
 | `/uiscale wide even\|overhang\|squeeze\|smaller\|spacing` | How sharp text handles wide letters (W, M) that do not fit the game's letter spacing. `even` (spread letters evenly over the line) gave the best results. |

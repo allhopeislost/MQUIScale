@@ -28,6 +28,8 @@ A [MacroQuest](https://github.com/macroquest/macroquest) plugin that draws the E
 3. Start MacroQuest and EverQuest, then in game: `/plugin mquiscale`
 4. `/uiscale 1.5` (or use the slider in the window that `/uiscale ui` shows).
 
+The plugin does nothing until you choose a factor above 1.0. `/plugin mquiscale unload` removes all hooks and restores the screen size and window positions.
+
 ### Verify the download
 
 SHA-256 of `MQUIScale.dll` v2.7:
@@ -37,8 +39,6 @@ SHA-256 of `MQUIScale.dll` v2.7:
 ```
 
 Check it in PowerShell with `Get-FileHash MQUIScale.dll` (or `certutil -hashfile MQUIScale.dll SHA256` in a command prompt). If the value differs, do not use the file.
-
-The plugin does nothing until you choose a factor above 1.0. `/plugin mquiscale unload` removes all hooks and restores the screen size and window positions.
 
 ## Commands
 

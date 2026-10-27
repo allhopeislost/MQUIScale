@@ -30,15 +30,6 @@ A [MacroQuest](https://github.com/macroquest/macroquest) plugin that draws the E
 
 The plugin does nothing until you choose a factor above 1.0. `/plugin mquiscale unload` removes all hooks and restores the screen size and window positions.
 
-### Verify the download
-
-SHA-256 of `MQUIScale.dll` v3.1:
-
-```
-DDA96AD148EEA9F34805A9F9A7907CFE06DE1FFC53632307FAA404CFE03F7A84
-```
-
-Check it in PowerShell with `Get-FileHash MQUIScale.dll` (or `certutil -hashfile MQUIScale.dll SHA256` in a command prompt). If the value differs, do not use the file.
 
 ## Commands
 

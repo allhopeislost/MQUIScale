@@ -41,9 +41,10 @@
 #include <algorithm>
 #include <cmath>
 #include <map>
+#include <vector>
 
 PreSetup("MQUIScale");
-PLUGIN_VERSION(2.7);
+PLUGIN_VERSION(3.1);
 
 // mq::AddRenderCallbacks (MacroQuest's render callback API, available through
 // mq/Plugin.h) is used to release our D3DPOOL_DEFAULT buffer when the device
@@ -53,7 +54,7 @@ PLUGIN_VERSION(2.7);
 // State
 
 static constexpr float MinScale = 1.0f;
-static constexpr float MaxScale = 3.0f;
+static constexpr float MaxScale = 2.0f;
 
 static float s_scale = 1.0f;              // current UI scale factor
 static int s_iniDepth = 0;                 // > 0 while EQ loads/stores a window's ini info
@@ -73,13 +74,13 @@ static uintptr_t s_addrSetScissorRect = 0;
 // Our own vertex buffer that receives the scaled copies.
 static IDirect3DVertexBuffer9* s_scaledVB = nullptr;
 static UINT s_scaledVBSize = 0;
+static UINT s_scaledVBPos = 0;   // next free byte in s_scaledVB (ring buffer)
+static std::vector<uint8_t> s_scratch;   // CPU copy of one draw's vertices
 
 // Per-frame counters for the ImGui window (useful for the test report).
 struct DrawStats
 {
-	int scaled = 0;        // UI draws we scaled
 	int notRHW = 0;        // draws during the UI pass that were not XYZRHW
-	int failed = 0;        // UI draws we could not scale (lock/read failed), drawn unscaled
 	int uiPasses = 0;      // number of C2DPrimitiveManager::Render calls
 	int keptVertices = 0;  // vertices left unscaled by the name tag filter
 	int sharpText = 0;     // text draws that used a twin texture
@@ -276,10 +277,21 @@ static void ReleaseScaledVB()
 		s_scaledVB = nullptr;
 	}
 	s_scaledVBSize = 0;
+	s_scaledVBPos = 0;
 }
+
+// Test result (v2.7): in a busy Bazaar the plugin cost 20 fps (61 -> 40).
+// Every scaled draw used to lock our buffer with D3DLOCK_DISCARD at the
+// size of the game's (large) vertex buffer, and the vertices were then read
+// back and edited inside that locked, write-combined memory. Now the buffer
+// is a ring: each draw appends its vertices with D3DLOCK_NOOVERWRITE and
+// only wraps around (DISCARD) when it is full, and all editing happens in
+// s_scratch, which is copied into the buffer once.
+static constexpr UINT ScaledVBMinSize = 4 * 1024 * 1024;
 
 static bool EnsureScaledVB(IDirect3DDevice9* device, UINT size)
 {
+	size = std::max(size, ScaledVBMinSize);
 	if (s_scaledVB && s_scaledVBSize >= size)
 		return true;
 
@@ -1050,7 +1062,8 @@ static void SpreadLines(uint8_t* base, UINT numVertices, UINT stride, const Twin
 
 	// A line: glyphs, each with the gap (in game pixels) that precedes it.
 	struct Item { GlyphQuad q; float gapBefore; };
-	std::vector<Item> line;
+	static std::vector<Item> line;   // kept between draws: no allocation per draw
+	line.clear();
 	float pendingGap = 0.0f;
 
 	auto flush = [&]() {
@@ -1310,9 +1323,12 @@ struct TwinBinding
 };
 
 // Copies vertices [firstVertex, firstVertex + numVertices) of stream 0 into our
-// own buffer at the same byte offset, with x and y multiplied by the factor.
-// On success, binds our buffer as stream 0 and returns the original stream so
-// the caller can restore it after drawing.
+// own ring buffer, with x and y multiplied by the factor. On success
+// (CopyResult::Bound), binds our buffer as stream 0 (offset 0), returns in
+// `newFirstVertex` where vertex `firstVertex` now is, and returns the
+// original stream so the caller can restore it after drawing.
+// CopyResult::Unchanged: nothing in the draw is scaled (a text draw with only
+// name tags), draw the game's own vertices.
 struct BoundStream
 {
 	IDirect3DVertexBuffer9* vb = nullptr;
@@ -1320,10 +1336,218 @@ struct BoundStream
 	UINT stride = 0;
 };
 
+//============================================================================
+// Shadow copies of the game's UI vertex buffers
+//
+// Test result (v2.8, busy Bazaar): 18 ms per frame in our draw hooks for 271
+// draws, about 65 us per draw. The time goes to reading the game's vertices
+// back: a D3DLOCK_READONLY lock of a buffer the GPU is still using makes the
+// driver (DXVK) wait for the GPU / its worker thread, once per draw.
+//
+// Read each tracked buffer once to seed a CPU copy, including buffers filled
+// before the plugin was loaded. IDirect3DVertexBuffer9::Lock and
+// Unlock are detoured; for the buffers the UI draws from, the game gets a
+// pointer into our own CPU copy ("shadow") to write into, and on Unlock we
+// copy what it wrote into the real buffer (a plain sequential write). The
+// draw hook then reads the vertices from the shadow. Pages of the shadow
+// that were not written through our Lock (written before we started
+// tracking, or by an odd lock) are seeded on the next draw. Release removes
+// the copy when the real buffer dies, even if its address is reused later.
+// CPU vertex payload is capped at 128 MiB; untracked buffers fall back to
+// reading just the draw range. DISCARD invalidates the old contents.
+
+struct ShadowBuffer
+{
+	std::vector<uint8_t> data;
+	std::map<UINT, UINT> written;   // byte ranges [first, second) with known content, merged
+	// The lock in progress that we redirected into `data`.
+	bool locked = false;
+	void* realData = nullptr;
+	UINT lockOffset = 0;
+	UINT lockSize = 0;
+};
+static constexpr size_t MaxShadowBytes = 128u * 1024u * 1024u;
+static size_t s_shadowBytes = 0;
+static std::map<IDirect3DVertexBuffer9*, ShadowBuffer> s_shadows;
+static uintptr_t s_addrVBRelease = 0;
+static uintptr_t s_addrVBLock = 0;
+static uintptr_t s_addrVBUnlock = 0;
+static bool s_vbHooksInstalled = false;
+
+static auto EraseShadowBuffer(std::map<IDirect3DVertexBuffer9*, ShadowBuffer>::iterator it)
+{
+	s_shadowBytes -= it->second.data.size();
+	return s_shadows.erase(it);
+}
+
+// Adds [offset, offset + size) to the known ranges. The game usually appends
+// batch after batch, so this stays one or a few ranges.
+static void MarkShadowWritten(ShadowBuffer& shadow, UINT offset, UINT size)
+{
+	if (size == 0)
+		return;
+	UINT first = offset, last = offset + size;
+	auto it = shadow.written.upper_bound(first);
+	if (it != shadow.written.begin())
+	{
+		auto prev = std::prev(it);
+		if (prev->second >= first)
+		{
+			first = prev->first;
+			last = std::max(last, prev->second);
+			it = shadow.written.erase(prev);
+		}
+	}
+	while (it != shadow.written.end() && it->first <= last)
+	{
+		last = std::max(last, it->second);
+		it = shadow.written.erase(it);
+	}
+	shadow.written.emplace(first, last);
+}
+
+static bool ShadowCovers(const ShadowBuffer& shadow, UINT offset, UINT size)
+{
+	if (shadow.locked || size == 0 || offset > shadow.data.size() || size > shadow.data.size() - offset)
+		return false;
+	auto it = shadow.written.upper_bound(offset);
+	if (it == shadow.written.begin())
+		return false;
+	--it;
+	return it->first <= offset && it->second >= offset + size;
+}
+
+class VertexBufferHooks
+{
+public:
+	IDirect3DVertexBuffer9* Buffer() { return reinterpret_cast<IDirect3DVertexBuffer9*>(this); }
+
+	DETOUR_TRAMPOLINE_DEF(ULONG WINAPI, Release_Trampoline, ())
+	ULONG WINAPI Release_Detour()
+	{
+		IDirect3DVertexBuffer9* vb = Buffer();
+		const ULONG refs = Release_Trampoline();
+		// The object is already destroyed at zero: only use its saved map key.
+		if (refs == 0)
+		{
+			auto it = s_shadows.find(vb);
+			if (it != s_shadows.end())
+				EraseShadowBuffer(it);
+		}
+		return refs;
+	}
+
+	DETOUR_TRAMPOLINE_DEF(HRESULT WINAPI, Lock_Trampoline, (UINT, UINT, void**, DWORD))
+	HRESULT WINAPI Lock_Detour(UINT offset, UINT size, void** data, DWORD flags)
+	{
+		HRESULT hr = Lock_Trampoline(offset, size, data, flags);
+		if (FAILED(hr) || data == nullptr || *data == nullptr || (flags & D3DLOCK_READONLY))
+			return hr;
+
+		auto it = s_shadows.find(Buffer());
+		if (it == s_shadows.end())
+			return hr;
+		ShadowBuffer& shadow = it->second;
+		const UINT total = static_cast<UINT>(shadow.data.size());
+		if (size == 0 && offset < total)
+			size = total - offset;
+		if (shadow.locked || offset > total || size > total - offset)
+		{
+			// Nested or odd lock: the game writes the real buffer directly,
+			// so nothing in our copy can be trusted any more.
+			shadow.written.clear();
+			return hr;
+		}
+		if (flags & D3DLOCK_DISCARD)
+			shadow.written.clear();
+		else if (!ShadowCovers(shadow, offset, size))
+		{
+			// A regular Lock may patch only part of its range. Preserve bytes
+			// the caller leaves alone before redirecting its pointer.
+			memcpy(shadow.data.data() + offset, *data, size);
+		}
+
+		shadow.locked = true;
+		shadow.realData = *data;
+		shadow.lockOffset = offset;
+		shadow.lockSize = size;
+		*data = shadow.data.data() + offset;
+		return hr;
+	}
+
+	DETOUR_TRAMPOLINE_DEF(HRESULT WINAPI, Unlock_Trampoline, ())
+	HRESULT WINAPI Unlock_Detour()
+	{
+		auto it = s_shadows.find(Buffer());
+		if (it != s_shadows.end() && it->second.locked)
+		{
+			ShadowBuffer& shadow = it->second;
+			memcpy(shadow.realData, shadow.data.data() + shadow.lockOffset, shadow.lockSize);
+			MarkShadowWritten(shadow, shadow.lockOffset, shadow.lockSize);
+			shadow.locked = false;
+			shadow.realData = nullptr;
+		}
+		const HRESULT hr = Unlock_Trampoline();
+		if (FAILED(hr) && it != s_shadows.end())
+			it->second.written.clear();
+		return hr;
+	}
+};
+
+static void InstallVertexBufferHooks(IDirect3DVertexBuffer9* vb)
+{
+	if (s_vbHooksInstalled)
+		return;
+	uintptr_t* vtable = *reinterpret_cast<uintptr_t**>(vb);
+	s_addrVBRelease = vtable[2];   // IUnknown::Release
+	s_addrVBLock = vtable[11];     // IDirect3DVertexBuffer9::Lock
+	s_addrVBUnlock = vtable[12];   // IDirect3DVertexBuffer9::Unlock
+	mq::AddDetour(s_addrVBRelease, &VertexBufferHooks::Release_Detour,
+		&VertexBufferHooks::Release_Trampoline_Ptr, "MQUIScale_VertexBuffer_Release");
+	mq::AddDetour(s_addrVBLock, &VertexBufferHooks::Lock_Detour,
+		&VertexBufferHooks::Lock_Trampoline_Ptr, "MQUIScale_VertexBuffer_Lock");
+	mq::AddDetour(s_addrVBUnlock, &VertexBufferHooks::Unlock_Detour,
+		&VertexBufferHooks::Unlock_Trampoline_Ptr, "MQUIScale_VertexBuffer_Unlock");
+	s_vbHooksInstalled = true;
+}
+
+static void RemoveVertexBufferHooks()
+{
+	if (s_vbHooksInstalled)
+	{
+		mq::RemoveDetour(s_addrVBUnlock);
+		mq::RemoveDetour(s_addrVBLock);
+		mq::RemoveDetour(s_addrVBRelease);
+		s_vbHooksInstalled = false;
+	}
+	// A lock in progress would still point into our copy: never the case
+	// here (the game locks and unlocks within one call), but write it out.
+	for (auto& [vb, shadow] : s_shadows)
+	{
+		if (shadow.locked && shadow.realData)
+			memcpy(shadow.realData, shadow.data.data() + shadow.lockOffset, shadow.lockSize);
+	}
+	s_shadows.clear();
+	s_shadowBytes = 0;
+}
+
+// Starts shadowing a buffer the UI draws from. The first draw seeds its
+// existing contents; subsequent writes are captured by the Lock hooks.
+static void TrackUIVertexBuffer(IDirect3DVertexBuffer9* vb, UINT size)
+{
+	if (s_shadows.count(vb) || size == 0 || size > MaxShadowBytes - s_shadowBytes)
+		return;
+	InstallVertexBufferHooks(vb);
+	s_shadows[vb].data.resize(size);
+	s_shadowBytes += size;
+}
+
 // `sharpText`: the text is drawn from a twin texture. `scaledGlyphs` returns
 // how many glyphs were scaled (0 = only name tags, keep the game's texture).
-static bool BindScaledCopy(IDirect3DDevice9* device, UINT firstVertex, UINT numVertices, BoundStream& original,
-	const TwinTexture* twin, int& scaledGlyphs)
+enum class CopyResult { Failed, Unchanged, Bound };
+
+static CopyResult BindScaledCopy(IDirect3DDevice9* device, UINT firstVertex, UINT numVertices, BoundStream& original,
+	const TwinTexture* twin, int& scaledGlyphs, UINT& newFirstVertex)
 {
 	const bool sharpText = twin != nullptr;
 	scaledGlyphs = 0;
@@ -1331,41 +1555,83 @@ static bool BindScaledCopy(IDirect3DDevice9* device, UINT firstVertex, UINT numV
 	if (FAILED(device->GetStreamSource(0, &original.vb, &original.offset, &original.stride))
 		|| original.vb == nullptr || original.stride < 8)
 	{
-		return false;
+		return CopyResult::Failed;
 	}
 
 	D3DVERTEXBUFFER_DESC desc;
 	if (FAILED(original.vb->GetDesc(&desc)))
-		return false;
+		return CopyResult::Failed;
 
-	const UINT start = original.offset + firstVertex * original.stride;
-	const UINT bytes = numVertices * original.stride;
-	if (bytes == 0 || start + bytes > desc.Size)
-		return false;
+	const uint64_t start64 = static_cast<uint64_t>(original.offset) + static_cast<uint64_t>(firstVertex) * original.stride;
+	const uint64_t bytes64 = static_cast<uint64_t>(numVertices) * original.stride;
+	if (bytes64 == 0 || start64 > desc.Size || bytes64 > desc.Size - start64)
+		return CopyResult::Failed;
+	const UINT start = static_cast<UINT>(start64);
+	const UINT bytes = static_cast<UINT>(bytes64);
 
-	if (!EnsureScaledVB(device, desc.Size))
-		return false;
-
-	// Read the client's vertices. We only lock for reading; the client's data
-	// stays exactly as it was.
-	void* src = nullptr;
-	if (FAILED(original.vb->Lock(start, bytes, &src, D3DLOCK_READONLY)) || src == nullptr)
-		return false;
-
-	void* dst = nullptr;
-	if (FAILED(s_scaledVB->Lock(start, bytes, &dst, D3DLOCK_DISCARD)) || dst == nullptr)
+	// The client's vertices into our scratch copy: from the shadow when it
+	// has them (see "Shadow copies"), else read back from the buffer.
+	if (s_scratch.size() < bytes)
+		s_scratch.resize(bytes);
+	auto shadow = s_shadows.find(original.vb);
+	if (shadow != s_shadows.end() && shadow->second.data.size() != desc.Size && !shadow->second.locked)
 	{
-		original.vb->Unlock();
-		return false;
+		// Another buffer at the address of one we copied: start over.
+		EraseShadowBuffer(shadow);
+		shadow = s_shadows.end();
 	}
-
-	memcpy(dst, src, bytes);
-	original.vb->Unlock();
+	if (shadow != s_shadows.end() && ShadowCovers(shadow->second, start, bytes))
+	{
+		memcpy(s_scratch.data(), shadow->second.data.data() + start, bytes);
+	}
+	else
+	{
+		if (shadow == s_shadows.end())
+		{
+			TrackUIVertexBuffer(original.vb, desc.Size);
+			shadow = s_shadows.find(original.vb);
+		}
+		const bool seed = shadow != s_shadows.end() && !shadow->second.locked;
+		void* src = nullptr;
+		if (FAILED(original.vb->Lock(seed ? 0 : start, seed ? desc.Size : bytes, &src, D3DLOCK_READONLY)) || src == nullptr)
+			return CopyResult::Failed;
+		if (seed)
+		{
+			memcpy(shadow->second.data.data(), src, desc.Size);
+			memcpy(s_scratch.data(), shadow->second.data.data() + start, bytes);
+		}
+		else
+			memcpy(s_scratch.data(), src, bytes);
+		const HRESULT unlockHr = original.vb->Unlock();
+		if (seed && SUCCEEDED(unlockHr))
+			MarkShadowWritten(shadow->second, 0, desc.Size);
+		if (FAILED(unlockHr))
+			return CopyResult::Failed;
+	}
 
 	// XYZRHW: the first three floats of every vertex are screen x, y and z.
 	// Text is handled per glyph (4 vertices), everything else per vertex.
 	const bool isText = original.stride == TextVertexStride;
 	const UINT group = (isText && s_nameTagFilter) ? 4 : 1;
+	uint8_t* base = s_scratch.data();
+
+	// A text draw with only name tags (most text in a busy Bazaar) is drawn
+	// as the game made it. The name tag marker stays in its specular, which is
+	// harmless (see NameTagSpecularMarker).
+	if (group == 4 && s_nameTagMarkerInstalled && numVertices >= 4)
+	{
+		bool anyScaled = false;
+		for (UINT first = 0; first < numVertices && !anyScaled; first += 4)
+		{
+			const auto* v = reinterpret_cast<const FONT_D3DTLVERTEX*>(base + first * original.stride);
+			anyScaled = v->specular != NameTagSpecularMarker;
+		}
+		if (!anyScaled)
+		{
+			s_stats.keptVertices += numVertices;
+			return CopyResult::Unchanged;
+		}
+	}
 
 	// The game places glyphs at x - 0.5 so D3D9 pixel centers hit texel
 	// centers. Scaling around 0,0 turns that into -0.5 * f, which lands
@@ -1374,21 +1640,20 @@ static bool BindScaledCopy(IDirect3DDevice9* device, UINT firstVertex, UINT numV
 	const bool pixelCorner = isText && sharpText;
 
 	if (pixelCorner && group == 4 && s_wideGlyphs == WideGlyphs::Even && !twin->wideCells.empty())
-		SpreadLines(static_cast<uint8_t*>(dst), numVertices, original.stride, *twin);
+		SpreadLines(base, numVertices, original.stride, *twin);
 
 	// The label rect marks (see ClipRectGlyphHook) go back to the game's value.
 	if (isText)
 	{
 		for (UINT i = 0; i < numVertices; ++i)
 		{
-			uint32_t* specular = reinterpret_cast<uint32_t*>(static_cast<uint8_t*>(dst) + i * original.stride
+			uint32_t* specular = reinterpret_cast<uint32_t*>(base + i * original.stride
 				+ offsetof(FONT_D3DTLVERTEX, specular));
 			if ((*specular & 0xFF000000u) == ClipMarkerTag)
 				*specular = GlyphSpecular;
 		}
 	}
 
-	uint8_t* base = static_cast<uint8_t*>(dst);
 	for (UINT first = 0; first < numVertices; first += group)
 	{
 		const UINT count = std::min(group, numVertices - first);
@@ -1452,10 +1717,26 @@ static bool BindScaledCopy(IDirect3DDevice9* device, UINT firstVertex, UINT numV
 		}
 	}
 
+	// Append to the ring buffer, at a whole vertex so the draw can address it.
+	if (!EnsureScaledVB(device, bytes))
+		return CopyResult::Failed;
+	UINT pos = (s_scaledVBPos + original.stride - 1) / original.stride * original.stride;
+	DWORD lockFlags = D3DLOCK_NOOVERWRITE;
+	if (pos + bytes > s_scaledVBSize)
+	{
+		pos = 0;
+		lockFlags = D3DLOCK_DISCARD;
+	}
+	void* dst = nullptr;
+	if (FAILED(s_scaledVB->Lock(pos, bytes, &dst, lockFlags)) || dst == nullptr)
+		return CopyResult::Failed;
+	memcpy(dst, base, bytes);
 	s_scaledVB->Unlock();
+	s_scaledVBPos = pos + bytes;
 
-	device->SetStreamSource(0, s_scaledVB, original.offset, original.stride);
-	return true;
+	newFirstVertex = pos / original.stride;
+	device->SetStreamSource(0, s_scaledVB, 0, original.stride);
+	return CopyResult::Bound;
 }
 
 static void RestoreStream(IDirect3DDevice9* device, BoundStream& original)
@@ -1503,19 +1784,19 @@ public:
 		const TwinTexture* twin = FindBoundTwin(device);
 		BoundStream original;
 		int scaledGlyphs = 0;
-		if (!BindScaledCopy(device, startVertex, VertexCountForPrimitives(type, primitiveCount), original,
-			twin, scaledGlyphs))
+		UINT newStart = 0;
+		const CopyResult result = BindScaledCopy(device, startVertex, VertexCountForPrimitives(type, primitiveCount),
+			original, twin, scaledGlyphs, newStart);
+		if (result != CopyResult::Bound)
 		{
 			if (original.vb) original.vb->Release();
-			++s_stats.failed;
 			return DrawPrimitive_Trampoline(type, startVertex, primitiveCount);
 		}
 
-		++s_stats.scaled;
 		SamplerOverride sampler;
 		TwinBinding binding;
 		BindTextures(device, original, twin ? twin->texture : nullptr, scaledGlyphs, sampler, binding);
-		HRESULT hr = DrawPrimitive_Trampoline(type, startVertex, primitiveCount);
+		HRESULT hr = DrawPrimitive_Trampoline(type, newStart, primitiveCount);
 		binding.Restore(device);
 		sampler.Restore(device);
 		RestoreStream(device, original);
@@ -1531,24 +1812,25 @@ public:
 			return DrawIndexedPrimitive_Trampoline(type, baseVertexIndex, minVertexIndex, numVertices, startIndex, primitiveCount);
 
 		// The indices refer to vertices [base + min, base + min + numVertices).
-		// Our copy keeps the same layout, so the client's index buffer and the
-		// draw parameters can be used unchanged.
+		// Our copy keeps them in the same order, so only the base vertex index
+		// changes: index `min` must land on the copy's first vertex.
 		const TwinTexture* twin = FindBoundTwin(device);
 		BoundStream original;
 		int scaledGlyphs = 0;
-		if (!BindScaledCopy(device, baseVertexIndex + minVertexIndex, numVertices, original,
-			twin, scaledGlyphs))
+		UINT newFirst = 0;
+		const CopyResult result = BindScaledCopy(device, baseVertexIndex + minVertexIndex, numVertices, original,
+			twin, scaledGlyphs, newFirst);
+		if (result != CopyResult::Bound)
 		{
 			if (original.vb) original.vb->Release();
-			++s_stats.failed;
 			return DrawIndexedPrimitive_Trampoline(type, baseVertexIndex, minVertexIndex, numVertices, startIndex, primitiveCount);
 		}
 
-		++s_stats.scaled;
 		SamplerOverride sampler;
 		TwinBinding binding;
 		BindTextures(device, original, twin ? twin->texture : nullptr, scaledGlyphs, sampler, binding);
-		HRESULT hr = DrawIndexedPrimitive_Trampoline(type, baseVertexIndex, minVertexIndex, numVertices, startIndex, primitiveCount);
+		const INT newBase = static_cast<INT>(newFirst) - static_cast<INT>(minVertexIndex);
+		HRESULT hr = DrawIndexedPrimitive_Trampoline(type, newBase, minVertexIndex, numVertices, startIndex, primitiveCount);
 		binding.Restore(device);
 		sampler.Restore(device);
 		RestoreStream(device, original);
@@ -2056,6 +2338,85 @@ static void FitWindowsToScreen()
 	}
 }
 
+// CharacterSelectWnd can be created after the saved scale has already changed
+// ScreenExtent. On a cold start it may still use the physical viewport size,
+// which makes its bottom-anchored controls fall outside the logical screen.
+// Unlike normal top-level windows, this screen's layout is controlled by its
+// own size. Its SIDL child screens also need one explicit resize pass when
+// first seen, since the screen can be constructed before the logical extent
+// is active on startup.
+static CCharacterListWnd* s_charSelectLayoutWindow = nullptr;
+
+static void FitCharacterSelectWindowToScreen()
+{
+	if (s_inLoginFrontend || GetGameState() != GAMESTATE_CHARSELECT || !pWndMgr || !pCharacterListWnd)
+		return;
+
+	CXWnd* wnd = pCharacterListWnd;
+	if (wnd->GetParentWindow() != nullptr)
+		return;
+
+	bool isLiveWindow = false;
+	for (int i = 0; i < pWndMgr->pWindows.GetCount(); ++i)
+	{
+		if (pWndMgr->pWindows[i] == wnd)
+		{
+			isLiveWindow = true;
+			break;
+		}
+	}
+	if (!isLiveWindow)
+		return;
+
+	const int logicalX = static_cast<int>(pWndMgr->ScreenExtentX);
+	const int logicalY = static_cast<int>(pWndMgr->ScreenExtentY);
+	if (logicalX <= 0 || logicalY <= 0)
+		return;
+
+	const CXRect rc = wnd->GetLocation();
+	const bool resizeNeeded = rc.left != 0 || rc.top != 0 || rc.GetWidth() != logicalX || rc.GetHeight() != logicalY;
+	const bool newWindow = s_charSelectLayoutWindow != pCharacterListWnd;
+	if (!resizeNeeded && !newWindow)
+		return;
+
+	if (resizeNeeded)
+		wnd->Move(CXRect(0, 0, logicalX, logicalY), true, true, true, true);
+
+	// Re-run the SIDL resize handler to reposition nested screens/buttons using
+	// their anchors against the now-logical root size.
+	pCharacterListWnd->OnResize(logicalX, logicalY);
+	pCharacterListWnd->UpdateLayout(true);
+
+	// Some CharacterListWnd child screens are positioned from the physical
+	// viewport during InitCharSelectUI and keep those coordinates after the root
+	// resize. In particular Left_Screen is vertically centered and Bottom_Screen
+	// is anchored to the physical bottom. Map those two root children into the
+	// logical extent; moving a parent carries its contained controls with it.
+	int realX = 0;
+	int realY = 0;
+	if (GetRealUISize(realX, realY) && realX > 0 && realY > 0)
+	{
+		for (CXWnd* child = pCharacterListWnd->GetFirstChildWnd(); child; child = child->GetNextSiblingWnd())
+		{
+			const std::string_view name = child->GetXMLNameSv();
+			if (name != "CLW_LeftScreen" && name != "CLW_BottomScreen")
+				continue;
+
+			const CXRect childRect = child->GetLocation();
+			if (childRect.left >= 0 && childRect.top >= 0
+				&& childRect.right <= logicalX && childRect.bottom <= logicalY)
+				continue;
+
+			const CXPoint logicalPosition(
+				MapRelative(childRect.left, childRect.GetWidth(), realX, logicalX),
+				MapRelative(childRect.top, childRect.GetHeight(), realY, logicalY));
+			child->Move(logicalPosition);
+		}
+	}
+
+	s_charSelectLayoutWindow = pCharacterListWnd;
+}
+
 // --- Window positions in EQ's UI ini ---------------------------------------
 // Test result: windows came back slightly off after a relog. EQ stores a
 // window as its distance to the nearest screen edge, using the screen size
@@ -2542,6 +2903,7 @@ static void RemoveHooks()
 		RelayoutTextObjects();
 	}
 	RemoveMouseHooks();
+	RemoveVertexBufferHooks();
 	if (s_uiHookInstalled)
 		mq::RemoveDetour(C2DPrimitiveManager__Render);
 	mq::RemoveDetour(s_addrSetScissorRect);
@@ -2564,16 +2926,45 @@ static void SetScale(float factor)
 
 	ApplyScreenExtent();
 	FitWindowsToScreen();
+	FitCharacterSelectWindowToScreen();
 }
 
 //============================================================================
 // Diagnostics: /uiscale dump
 //
-// Writes the screen sizes and every top-level window (where we put it, where
-// it is now) to Logs\MQUIScale.log, once right away and once again a moment
-// later, so we can see whether the game moves windows back.
+// Writes the screen sizes and window layout to Logs\MQUIScale.log.
 
-static int s_pendingDumpPulses = 0;
+static int DumpWindowTree(FILE* file, CXWnd* wnd, int depth, int& count)
+{
+	constexpr int MaxWindows = 256;
+	constexpr int MaxDepth = 6;
+	if (!wnd || count >= MaxWindows)
+		return count;
+
+	++count;
+	const CXRect local = wnd->GetLocation();
+	const CXRect screen = wnd->GetScreenRect();
+	const CXStr name = wnd->GetXMLName();
+	const CXStr type = wnd->GetTypeName();
+	const uint32_t style = wnd->GetWindowStyle();
+	const int indent = std::min(depth * 2, 24);
+	fprintf(file,
+		"%*s%s <%s> vis=%d local=%d,%d %dx%d screen=%d,%d %dx%d style=%08X stretch=%d anchors=%d%d%d%d offsets=%d,%d,%d,%d\n",
+		indent, "", name.c_str(), type.c_str(), wnd->IsVisible() ? 1 : 0,
+		local.left, local.top, local.GetWidth(), local.GetHeight(),
+		screen.left, screen.top, screen.GetWidth(), screen.GetHeight(), style,
+		(style & CWS_AUTOSTRETCH) != 0 ? 1 : 0,
+		wnd->bLeftAnchoredToLeft ? 1 : 0, wnd->bRightAnchoredToLeft ? 1 : 0,
+		wnd->bTopAnchoredToTop ? 1 : 0, wnd->bBottomAnchoredToTop ? 1 : 0,
+		wnd->GetLeftOffset(), wnd->GetTopOffset(), wnd->GetRightOffset(), wnd->GetBottomOffset());
+
+	if (depth < MaxDepth)
+	{
+		for (CXWnd* child = wnd->GetFirstChildWnd(); child && count < MaxWindows; child = child->GetNextSiblingWnd())
+			DumpWindowTree(file, child, depth + 1, count);
+	}
+	return count;
+}
 
 static void DumpState(const char* when)
 {
@@ -2681,6 +3072,19 @@ static void DumpState(const char* when)
 		}
 	}
 
+	if (pCharacterListWnd && pWndMgr && IsLiveWindow(pCharacterListWnd))
+	{
+		const CXRect rc = pCharacterListWnd->GetLocation();
+		fprintf(file, "CharacterList state: ptr=%p managerMain=%d controlsCreated=%d LastRes=%d x %d rect=%d,%d %dx%d layoutPass=%d\n",
+			pCharacterListWnd.get(), pWndMgr->MainWindow == pCharacterListWnd ? 1 : 0,
+			pCharacterListWnd->bControlsCreated ? 1 : 0, pCharacterListWnd->LastResX, pCharacterListWnd->LastResY,
+			rc.left, rc.top, rc.GetWidth(), rc.GetHeight(), s_charSelectLayoutWindow == pCharacterListWnd ? 1 : 0);
+		int count = 0;
+		fprintf(file, "CharacterList child layout (max depth 6, max 256 windows):\n");
+		DumpWindowTree(file, pCharacterListWnd, 0, count);
+		fprintf(file, "CharacterList child windows logged: %d\n", count);
+	}
+
 	fprintf(file, "\n");
 	fclose(file);
 }
@@ -2692,7 +3096,7 @@ static void UIScaleCommand(PlayerClient*, const char* line)
 
 	if (arg[0] == 0)
 	{
-		WriteChatf("\ag[MQUIScale]\ax scale %.2f, hooks %s. Usage: /uiscale <1.0-3.0> | off | ui | filter game|sharp|smooth | sharptext on|off | wide squeeze|overhang|smaller|spacing|even | condense on|off | dump",
+		WriteChatf("\ag[MQUIScale]\ax scale %.2f, hooks %s. Usage: /uiscale <1.0-2.0> | off | ui | filter game|sharp|smooth | sharptext on|off | wide squeeze|overhang|smaller|spacing|even | condense on|off | dump",
 			s_scale, s_hooksInstalled ? "on" : "not installed");
 		return;
 	}
@@ -2770,8 +3174,7 @@ static void UIScaleCommand(PlayerClient*, const char* line)
 	if (ci_equals(arg, "dump"))
 	{
 		DumpState("dump");
-		s_pendingDumpPulses = 60;   // and again a moment later
-		WriteChatf("\ag[MQUIScale]\ax state written to Logs\\MQUIScale.log (second dump follows shortly)");
+		WriteChatf("\ag[MQUIScale]\ax state written to Logs\\MQUIScale.log");
 		return;
 	}
 
@@ -2784,7 +3187,7 @@ static void UIScaleCommand(PlayerClient*, const char* line)
 	float factor = GetFloatFromString(arg, -1.0f);
 	if (factor <= 0.0f)
 	{
-		WriteChatf("\ar[MQUIScale]\ax '%s' is not a number. Usage: /uiscale <1.0-3.0> | off | ui | filter game|sharp|smooth | sharptext on|off | wide squeeze|overhang|smaller|spacing|even | condense on|off | dump", arg);
+		WriteChatf("\ar[MQUIScale]\ax '%s' is not a number. Usage: /uiscale <1.0-2.0> | off | ui | filter game|sharp|smooth | sharptext on|off | wide squeeze|overhang|smaller|spacing|even | condense on|off | dump", arg);
 		return;
 	}
 
@@ -2937,8 +3340,45 @@ static void ForgetWindowManagerState()
 	s_placedScreenY = 0;
 }
 
+// On a cold start, eqmain is unloaded just before EQ creates the character
+// select UI. Apply the saved logical extent to eqgame's manager now, before
+// CharacterListWnd and its anchored child screens are constructed.
+static void PrepareGameWindowManagerForCharacterSelect()
+{
+	if (s_scale == 1.0f || !pinstCXWndManager)
+		return;
+
+	CXWndManager* gameWndMgr = *reinterpret_cast<CXWndManager**>(pinstCXWndManager);
+	if (!gameWndMgr)
+		return;
+
+	int realX = 0;
+	int realY = 0;
+	if (pGraphicsEngine && pGraphicsEngine->pRender
+		&& pGraphicsEngine->pRender->D3DViewPort.Width > 0 && pGraphicsEngine->pRender->D3DViewPort.Height > 0)
+	{
+		realX = static_cast<int>(pGraphicsEngine->pRender->D3DViewPort.Width);
+		realY = static_cast<int>(pGraphicsEngine->pRender->D3DViewPort.Height);
+	}
+	else
+	{
+		realX = static_cast<int>(gameWndMgr->ScreenExtentX);
+		realY = static_cast<int>(gameWndMgr->ScreenExtentY);
+	}
+	if (realX <= 0 || realY <= 0)
+		return;
+
+	s_origExtentX = gameWndMgr->ScreenExtentX;
+	s_origExtentY = gameWndMgr->ScreenExtentY;
+	gameWndMgr->ScreenExtentX = static_cast<uint32_t>(realX / s_scale);
+	gameWndMgr->ScreenExtentY = static_cast<uint32_t>(realY / s_scale);
+	s_extentOverridden = true;
+}
+
 PLUGIN_API void OnLoginFrontendEntered()
 {
+	s_charSelectLayoutWindow = nullptr;
+
 	// Coming back from the game (camp to server select): give eqgame's window
 	// manager its own extent back before pWndMgr is eqmain's.
 	if (s_extentOverridden && pinstCXWndManager)
@@ -2967,7 +3407,9 @@ PLUGIN_API void OnLoginFrontendExited()
 	// eqmain.dll is about to go away: its windows and window manager too.
 	RemoveLoginMouseHooks();
 	s_inLoginFrontend = false;
+	s_charSelectLayoutWindow = nullptr;
 	ForgetWindowManagerState();
+	PrepareGameWindowManagerForCharacterSelect();
 }
 
 //============================================================================
@@ -2979,7 +3421,12 @@ PLUGIN_API void InitializePlugin()
 	AddCommand("/uiscale", UIScaleCommand);
 
 	mq::MQRenderCallbacks callbacks;
-	callbacks.InvalidateDeviceObjects = []() { ReleaseScaledVB(); };
+	callbacks.InvalidateDeviceObjects = []() {
+		ReleaseScaledVB();
+		// The game recreates its buffers; addresses may be reused.
+		for (auto it = s_shadows.begin(); it != s_shadows.end();)
+			it = it->second.locked ? std::next(it) : EraseShadowBuffer(it);
+	};
 	s_renderCallbacksId = mq::AddRenderCallbacks(callbacks);
 
 	InstallHooks();
@@ -3014,16 +3461,11 @@ PLUGIN_API void OnPulse()
 	if (!s_hooksInstalled)
 		InstallHooks();
 
-	if (s_pendingDumpPulses > 0 && --s_pendingDumpPulses == 0)
-	{
-		DumpState("dump, ~60 pulses later");
-		WriteChatf("\ag[MQUIScale]\ax second dump written.");
-	}
-
 	// The client resets the screen extent when the resolution changes.
 	ApplyScreenExtent();
 
 	ApplyPendingScale();
+	FitCharacterSelectWindowToScreen();
 	UpdateSharpText();
 	UpdateClipMarks();
 	if (s_relayoutText)
@@ -3051,6 +3493,7 @@ PLUGIN_API void OnReloadUI()
 	// New windows (after /loadskin or entering the world): fit them again.
 	ApplyScreenExtent();
 	FitWindowsToScreen();
+	FitCharacterSelectWindowToScreen();
 }
 
 PLUGIN_API void OnUpdateImGui()
@@ -3071,14 +3514,6 @@ PLUGIN_API void OnUpdateImGui()
 
 		if (ImGui::Button("Reset (1.0)"))
 			SetScale(1.0f);
-
-		// Whole factors give the cleanest result: every texel becomes an even block.
-		ImGui::SameLine();
-		if (ImGui::Button("2x"))
-			SetScale(2.0f);
-		ImGui::SameLine();
-		if (ImGui::Button("3x"))
-			SetScale(3.0f);
 
 		int filter = static_cast<int>(s_textureFilter);
 		ImGui::Text("Texture filter:");
@@ -3147,6 +3582,12 @@ PLUGIN_API void OnUpdateImGui()
 
 		ImGui::Separator();
 		ImGui::Checkbox("Name tag filter", &s_nameTagFilter);
+		ImGui::SameLine();
+		if (ImGui::Button("Dump"))
+		{
+			DumpState("dump button");
+			WriteChatf("\ag[MQUIScale]\ax state written to Logs\\MQUIScale.log");
+		}
 	}
 	ImGui::End();
 }

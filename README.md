@@ -12,13 +12,13 @@ A [MacroQuest](https://github.com/macroquest/macroquest) plugin that draws the E
 
 ## What it does
 
-- Scales everything the client draws as UI (windows, icons, text) by a factor from 1.0 to 3.0, around the top-left corner of the screen. MacroQuest's own ImGui windows are not affected.
+- Scales everything the client draws as UI (windows, icons, text) by a factor from 1.0 to 2.0, around the top-left corner of the screen. MacroQuest's own ImGui windows are not affected.
 - Gives the UI a smaller "logical" screen (screen size / factor), keeps windows inside it, and moves them back when you return to 1.0 or unload.
 - Corrects mouse input for the UI; clicks in the 3D world still get the real coordinates.
 - Works from the login and server select screens onward; the zoning/loading screen is not scaled.
 - Window positions saved by EverQuest (UI ini) stay correct, so playing at 1.0 later does not move your windows.
 - Name tags above heads are left at their normal size.
-- Optional "sharp text": glyphs are rendered again at 2x or 3x resolution so scaled text stays crisp instead of blurry.
+- Optional "sharp text": glyphs are rendered again at 2x or 3x resolution independently of the UI scale, so scaled text stays crisp instead of blurry.
 - Settings are saved in `config\MQUIScale.ini` and applied again next time. Defaults for a new install: texture filter Sharp, sharp text on, wide letters Even, condense letters on, label room off, spaces may shrink 30 %, name tag filter on.
 
 ## Install
@@ -32,10 +32,10 @@ The plugin does nothing until you choose a factor above 1.0. `/plugin mquiscale 
 
 ### Verify the download
 
-SHA-256 of `MQUIScale.dll` v2.7:
+SHA-256 of `MQUIScale.dll` v3.1:
 
 ```
-9f0a4b39181abde2bfcc9efcf48ae23d4c0a91b7f2584f7dde6660d640cdaf8c
+DDA96AD148EEA9F34805A9F9A7907CFE06DE1FFC53632307FAA404CFE03F7A84
 ```
 
 Check it in PowerShell with `Get-FileHash MQUIScale.dll` (or `certutil -hashfile MQUIScale.dll SHA256` in a command prompt). If the value differs, do not use the file.
@@ -45,7 +45,7 @@ Check it in PowerShell with `Get-FileHash MQUIScale.dll` (or `certutil -hashfile
 | Command | Effect |
 |---|---|
 | `/uiscale` | Show the current state and usage. |
-| `/uiscale <1.0-3.0>` | Set the scale factor. |
+| `/uiscale <1.0-2.0>` | Set the scale factor. |
 | `/uiscale off` | Back to 1.0 immediately. |
 | `/uiscale ui` | Show/hide the settings window (slider and options). |
 | `/uiscale filter game\|sharp\|smooth` | Texture filtering for scaled UI: as the game does, point (sharp) or linear (smooth). |
@@ -53,7 +53,7 @@ Check it in PowerShell with `Get-FileHash MQUIScale.dll` (or `certutil -hashfile
 | `/uiscale wide even\|overhang\|squeeze\|smaller\|spacing` | How sharp text handles wide letters (W, M) that do not fit the game's letter spacing. `even` (spread letters evenly over the line) gave the best results. |
 | `/uiscale condense [on\|off]` | With `wide even`: draw a crowded line slightly narrower instead of letting letters overlap. |
 | `/uiscale labelroom [on\|off]` | Experimental, works poorly, best left off. |
-| `/uiscale dump` | Write diagnostic information to `Logs\MQUIScale.log`. |
+| `/uiscale dump` | Write one diagnostic snapshot to `Logs\MQUIScale.log`. The settings window's Dump button does the same. |
 
 ## Known limitations
 
